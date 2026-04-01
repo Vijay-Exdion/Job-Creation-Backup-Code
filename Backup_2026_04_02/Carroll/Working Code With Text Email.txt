@@ -1,0 +1,1772 @@
+
+
+#########################################################################################################################################################################################
+
+import asyncio
+from playwright.async_api import async_playwright
+from configparser import ConfigParser
+from datetime import datetime, timedelta
+import pandas as pd
+import os
+import re
+import extract_msg
+from openpyxl.utils import get_column_letter
+import traceback
+
+
+BASE_FOLDER = r"C:\Users\vijay_m\OneDrive - Exdion Solutions Pvt. Ltd.-70692290\Documents\Project_Job_Creation\carroll"
+PDF_FOLDER = os.path.join(BASE_FOLDER, "Job_Creation")
+EXCEL_FILE_PATH = os.path.join(BASE_FOLDER, "Carroll_Tracker.xlsx")
+
+
+# ================= GET STARTING REFERENCE NUMBER =================
+
+def get_starting_ref_id():
+
+    if not os.path.exists(EXCEL_FILE_PATH):
+        return 1
+
+    df = pd.read_excel(EXCEL_FILE_PATH)
+
+    if "Reference ID" not in df.columns or df.empty:
+        return 1
+
+    existing_ids = df["Reference ID"].dropna()
+
+    numbers = (
+        existing_ids
+        .str.extract(r'REF(\d+)')[0]
+        .dropna()
+        .astype(int)
+    )
+
+    return numbers.max() + 1 if not numbers.empty else 1
+
+
+
+# LOGIN FUNCTION
+
+async def login(page, context):
+
+    config = ConfigParser()
+    config.read(os.path.join(BASE_FOLDER, "Config.ini"))
+
+    url = config.get("CarrollEpic", "Link")
+    EnterpriseID = config.get("CarrollEpic", "Enterprise_ID")
+    username = config.get("CarrollEpic", "User_ID")
+    password = config.get("CarrollEpic", "Password")
+
+    await page.goto(url, timeout=90000)
+
+    await page.get_by_role("textbox").fill(EnterpriseID) 
+
+    await page.locator("//button[.//span[contains(text(),'Contin')]]").click()
+
+    async with context.expect_page() as new_page_event:
+        await page.locator("//button[contains(text(),'Login')]").click()
+
+    login_page = await new_page_event.value
+
+    await login_page.locator("#usercode").fill(username)
+    await login_page.locator("#password").fill(password)
+
+    await login_page.locator("//button[.//div[text()='Login']]").click()
+
+    try:
+        later_btn = login_page.get_by_role("button", name="Later")
+        #login_page.locator("button:has-text('Later')").click()
+        await later_btn.wait_for(timeout=5000)
+        await later_btn.click()
+        print("Later Reset clicked")
+    except:
+        pass
+    
+    # login_page.wait_for_timeout(5000)
+    # #login_page.wait_for_event("close")  
+    # page.wait_for_load_state("networkidle")
+
+    await page.locator("//div[contains(@class,'drop-btn')]").first.click()
+    await page.locator("//span[@class='text' and text()='CARRO09_PROD']").click()
+
+    await page.locator("//button[.//span[contains(text(),'Contin')]]").click()
+
+    try:
+        await page.locator("//button[@data-automation-id='Yes']").click(timeout=3000)
+        print("Popup YES clicked")
+    except:
+        print("Login successful")
+
+    #await page.pause()  
+
+    return login_page
+
+# ------------- CODE FOR ALL FILE TO DOWNLOAD FROM .MSG FILE ----------------
+
+# def extract_attachments_from_msg(msg_path):
+#     try:
+#         msg = extract_msg.Message(msg_path)
+#         msg.save()  # Optional: ensures proper parsing
+
+#         save_folder = os.path.dirname(msg_path)
+
+#         for att in msg.attachments:
+#             filename = att.longFilename or att.shortFilename
+
+#             if not filename:
+#                 continue  # Skip if no valid filename
+
+#             file_path = os.path.join(save_folder, filename)
+
+#             # Handle duplicate filenames
+#             base, ext = os.path.splitext(file_path)
+#             counter = 1
+#             while os.path.exists(file_path):
+#                 file_path = f"{base}_{counter}{ext}"
+#                 counter += 1
+
+#             # Save file
+#             with open(file_path, "wb") as f:
+#                 f.write(att.data)
+
+#             print("Extracted:", file_path)
+
+#     except Exception as e:
+#         print("MSG Extraction Error:", e)
+
+  
+def extract_pdf_from_msg(msg_path):
+    try:
+        msg = extract_msg.Message(msg_path)
+        save_folder = os.path.dirname(msg_path)
+
+        for att in msg.attachments:
+            filename = att.longFilename or att.shortFilename
+
+            # Extract only Quote.pdf (if you want exact match)
+            if filename and filename.lower() == "quote.pdf":
+
+                pdf_path = os.path.join(save_folder, filename)
+
+                with open(pdf_path, "wb") as f:
+                    f.write(att.data)
+
+                print("Extracted:", pdf_path)
+
+    except Exception as e:
+        print("MSG Extraction Error:", e)
+
+
+# SCRAPER FUNCTION
+
+async def scrape_records(page, start_id):
+
+    locator = page.get_by_text("Follow Up/Start")
+    await locator.wait_for(state="visible", timeout=20000)
+
+    await page.get_by_text("Customize View").click()
+    await page.locator('[data-automation-id="tpgActivitiesDisplayTab"]').click()
+    await page.get_by_text("Selected date range").click()
+
+    yesterday = datetime.now() - timedelta(days=3)
+    yesterday_str = f"{yesterday.month}/{yesterday.day}/{yesterday.year}"
+
+    print("Yesterday:", yesterday_str)
+
+    date_inputs = page.locator("input.date-edit[type='text']")
+    await date_inputs.first.wait_for(state="visible")
+
+    await date_inputs.nth(0).fill(yesterday_str)
+    await date_inputs.nth(1).fill(yesterday_str)
+
+    await page.get_by_role("button", name="Finish").click()
+
+    await page.wait_for_timeout(5000)
+
+    locator = page.get_by_text("Follow Up/Start")
+    await locator.wait_for(state="visible", timeout=20000)
+
+    data_list = []
+    row = 1
+    current_id = start_id
+
+    MAX_RETRIES = 3
+
+    while True:
+
+        data_visible = f"/html/body/root/app/program/div/div[2]/div[2]/div/div/screen/div/div/div/proxy[3]/div/asi-panel/div/proxy[3]/div/asi-frame/div/div[2]/proxy/div/asi-frame/div/div[2]/proxy[3]/div/asi-virtual-list-view/div/div/asi-virtual-list-table/div/div/div[2]/div[2]/div/div[{row}]/div[4]/div/span"
+        locator = page.locator(f"xpath={data_visible}")
+
+        # if await locator.count() == 0:
+        #     print("No more rows found")
+        #     await page.get_by_text("Logout").click()
+        #     #await page.locator('div.main-button:has-text("Logout")').click()
+        #     await page.locator("[data-automation-id='Yes']").click()
+        #     await page.wait_for_timeout(3000)
+        #     print("No more rows, Logout successful")
+        #     return data_list
+
+        try:
+            await locator.wait_for(state="visible", timeout=5000)
+        except:
+            print(f"Row {row} not visible — checking scroll...")
+
+            await page.mouse.wheel(0, 2000)
+            await page.wait_for_timeout(2000)
+
+            if await locator.count() == 0:
+                print("Confirmed end of rows")
+
+                await page.get_by_text("Logout").click()
+                await page.locator("[data-automation-id='Yes']").click()
+                await page.wait_for_timeout(3000)
+
+                return data_list
+            else:
+                print("Row loaded after scroll, continuing...")
+        
+        await locator.wait_for(state="visible", timeout=20000)
+
+        date_xpath = f"/html/body/root/app/program/div/div[2]/div[2]/div/div/screen/div/div/div/proxy[3]/div/asi-panel/div/proxy[3]/div/asi-frame/div/div[2]/proxy/div/asi-frame/div/div[2]/proxy[3]/div/asi-virtual-list-view/div/div/asi-virtual-list-table/div/div/div[2]/div[2]/div/div[{row}]/div[4]/div/span"
+
+        date_element = page.locator(f"xpath={date_xpath}")
+        await date_element.wait_for(timeout=5000)
+
+        date_text = (await date_element.inner_text()).strip()
+        print("Date Text:", date_text)
+        
+        if date_text != yesterday_str:
+            row += 1
+            continue
+
+        # -------- CREATE REF ID ONCE --------
+
+        timestamp = datetime.now().strftime("%Y%m%d")
+        ref_id = f"REF{str(current_id).zfill(6)}_{timestamp}"
+        current_id += 1
+        
+        
+        task_folder = os.path.join(PDF_FOLDER, ref_id)
+        os.makedirs(task_folder, exist_ok=True)
+
+        retry = 0
+
+        status = "Pending"
+
+        while retry < MAX_RETRIES:
+
+            try:
+
+                await page.wait_for_timeout(5000)
+
+                print("Processing Row:", row, "| Ref ID:", ref_id)
+
+                task_folder = os.path.join(PDF_FOLDER, ref_id)
+                os.makedirs(task_folder, exist_ok=True)
+
+                desc_xpath = f"/html/body/root/app/program/div/div[2]/div[2]/div/div/screen/div/div/div/proxy[3]/div/asi-panel/div/proxy[3]/div/asi-frame/div/div[2]/proxy/div/asi-frame/div/div[2]/proxy[3]/div/asi-virtual-list-view/div/div/asi-virtual-list-table/div/div/div[2]/div[2]/div/div[{row}]/div[1]/div/span"
+
+                desc_ele = page.locator(f"xpath={desc_xpath}")
+                await desc_ele.wait_for(timeout=10000)
+                await desc_ele.scroll_into_view_if_needed()
+
+                row_text = await desc_ele.inner_text()
+                print("Row clicked:", row_text)
+
+                await desc_ele.click(force=True)
+
+                await page.wait_for_timeout(10000)
+
+                open_activity = page.get_by_text("Open Activity", exact=True)
+                await open_activity.wait_for(state="visible", timeout=20000)
+
+                description = page.locator("//asi-string-edit//div").first
+                await description.wait_for(timeout=10000)
+                description_value = await description.get_attribute("data-value")
+                print("Description:", description_value)
+
+                await page.wait_for_timeout(5000)
+
+                association = page.locator('[data-automation-id="plhAssociation"] .text')
+                await association.wait_for(timeout=10000)
+                association_value = await association.text_content()
+                association_value = association_value.strip() if association_value else ""
+
+                print("Association:", association_value)
+
+                parts = [p.strip() for p in association_value.split("-")]
+
+                lob = parts[1] if len(parts) > 1 else ""
+                policy_no = parts[2] if len(parts) > 2 else ""
+
+                print("LOB:", lob)
+                print("Policy Number:", policy_no)
+
+                await page.locator("text=Account Detail").click()
+
+                account_name = page.locator("//div[text()='Account name']/following::div[@data-value][1]")
+                account_name_value = await account_name.get_attribute("data-value")
+                print("Account Name:", account_name_value)
+
+                lookup_code = page.locator("//div[text()='Lookup code']/following::div[@data-value][1]")
+                lookup_code_value = await lookup_code.get_attribute("data-value")
+                print("Lookup Code:", lookup_code_value)
+
+                await page.locator("[data-automation-id='tpgServicingTab']").click()
+
+                account_manager = page.locator('[data-automation-id="cboEmployee1"] input')
+                await account_manager.wait_for(timeout=10000)
+                account_manager_value = await account_manager.input_value()
+                print("Account Manager:", account_manager_value)
+
+                await page.locator("//span[normalize-space()='Activities']").click()
+                # await page.locator("//span[text()='Activities']").click()
+                # await page.locator("text=Activities").click()        # Best Option
+                print("Activities clicked")
+
+                access = page.locator("div.main-button", has_text="Access")
+                await access.wait_for()
+                await access.click()
+                print("Access clicked to download attachments")
+    
+                await page.locator("span.text.force-underline", has_text="Attachments").first.click()
+                print("Attachments clicked")
+
+                try:
+                    await page.wait_for_selector(
+                        "//div[contains(@data-automation-id,'vlvwAttachment body-row')]",
+                        state="visible",
+                        timeout=10000
+                    )
+                except:
+                    await page.wait_for_timeout(20000)
+
+                rows = page.locator("//div[contains(@data-automation-id,'vlvwAttachment body-row')]")
+                row_count = await rows.count()
+
+                print("Total Files:", row_count)
+
+                for i in range(row_count):
+
+                    retry = 0
+                    while retry < 3:
+                        try:
+
+                            file_xpath = f"(//div[contains(@data-automation-id,'vlvwAttachment body-row')]//div[contains(@class,'body-cell first')]//span[contains(@class,'text')])[{i+1}]"
+                            file_element = page.locator(f"xpath={file_xpath}")
+                            await file_element.wait_for(state="visible", timeout=15000)
+
+                            file_text = (await file_element.inner_text()).strip()
+                            print("Processing:", file_text)
+
+                            await file_element.scroll_into_view_if_needed()
+                            await file_element.dblclick()
+
+                            download_btn = page.locator("[data-automation-id='Download']")
+                            await download_btn.wait_for(state="visible")
+
+                            async with page.expect_download(timeout=20000) as d:
+                                await download_btn.click()
+
+                            download = await d.value
+
+                            file_name = re.sub(r'[<>:"/\\|?*]', '-', download.suggested_filename)
+
+                            save_path = os.path.join(task_folder, file_name)
+                            await download.save_as(save_path)
+
+                            print("Saved:", save_path)
+
+                            if save_path.lower().endswith(".msg"):
+                                extract_pdf_from_msg(save_path)
+
+                            await page.wait_for_timeout(3000)
+
+                            break
+
+                        except Exception as e:
+                            retry += 1
+                            print(f"Error at row {i+1} retry {retry}: {e}")
+                            await page.wait_for_timeout(3000)
+
+
+                data_list.append({
+                    "Date": date_text,
+                    "Account Manager": account_manager_value,
+                    "Lookup Code": lookup_code_value,
+                    "Account Name": account_name_value,
+                    "Description": description_value,
+                    "Policy number": policy_no,
+                    "LOB": lob,
+                    "Association": association_value,
+                    "Reference ID": ref_id,
+                    "Job ID": "",
+                    "Status": "Pending"
+                })
+
+
+                await page.locator("div.close-button").wait_for(state="visible")
+                await page.locator("div.close-button").click()
+
+                await page.locator("div.main-button:has-text('Home')").click()
+                print("Clicked Home button")
+
+                break
+
+            except Exception as e:
+                    
+                    await page.wait_for_timeout(10000)
+
+                    retry += 1
+                    #print(f"Error at row {row} retry {retry}: {e}")
+                    print(f"\n ERROR at row {row} retry {retry}")
+                    traceback.print_exc()
+
+                    home_btn = page.locator("div.main-button:has-text('Home')")
+
+                    if await home_btn.is_visible():
+                        await home_btn.click()
+                        print("Clicked Home before retry")
+
+                        await page.get_by_text("Follow Up/Start").wait_for(state="visible", timeout=20000)
+
+                    await page.wait_for_timeout(3000)
+
+                    if retry >= MAX_RETRIES:
+                        print(f"Skipping row {row} after {MAX_RETRIES} retries")
+
+                        data_list.append({
+                            "Date": date_text,
+                            "Account Manager": "",
+                            "Lookup Code": "",
+                            "Account Name": "",
+                            "Description": "",
+                            "Policy number": "",
+                            "LOB": "",
+                            "Association": "",
+                            "Reference ID": ref_id,
+                            "Job ID": "",
+                            "Status": "Error"
+                        })
+
+                        break
+
+        row += 1
+
+    return data_list
+
+
+# SAVE TO EXCEL FUNCTION
+
+def save_to_excel(data_list):
+
+    new_df = pd.DataFrame(data_list)
+
+    if os.path.exists(EXCEL_FILE_PATH):
+        old_df = pd.read_excel(EXCEL_FILE_PATH)
+        final_df = pd.concat([old_df, new_df], ignore_index=True)
+    else:
+        final_df = new_df
+    
+    final_df["Policy number"] = final_df["Policy number"].astype(str)
+    
+    with pd.ExcelWriter(EXCEL_FILE_PATH, engine="openpyxl") as writer:
+        final_df.to_excel(writer, index=False, sheet_name="Sheet1")
+
+        worksheet = writer.sheets["Sheet1"]
+
+        for i, col in enumerate(final_df.columns, 1):
+            max_len = max(final_df[col].astype(str).map(len).max(), len(col)) + 2
+            worksheet.column_dimensions[get_column_letter(i)].width = max_len
+    
+    print("Excel Saved Successfully")
+
+
+# MAIN FUNCTION
+
+async def run_epic():
+
+    start_id = get_starting_ref_id()
+
+    async with async_playwright() as p:
+
+        browser = await p.chromium.launch(channel="chrome", headless=False)
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        page.set_default_timeout(30000)
+
+        await login(page, context)
+
+        data_list = await scrape_records(page, start_id)
+
+        save_to_excel(data_list)
+
+        await context.close()
+        await browser.close()
+
+        #await page.pause()
+
+
+if __name__ == "__main__":
+    asyncio.run(run_epic())
+
+
+
+
+
+# ##############################------------------ Old Code ---------------------############################### 
+
+# import asyncio
+# import re
+# from playwright.async_api import async_playwright
+# from configparser import ConfigParser
+# import pandas as pd
+# import os
+# from datetime import datetime
+
+# # ================= PATH CONFIG =================
+
+# BASE_FOLDER = r"C:\Users\vijay_m\OneDrive - Exdion Solutions Pvt. Ltd.-70692290\Documents\Project_Job_Creation\carroll"
+
+# TRACKER_PATH = os.path.join(BASE_FOLDER, "Carroll_Tracker.xlsx")
+# LOB_MASTER_PATH = os.path.join(BASE_FOLDER, "Lob_Mapping.xlsx")
+# PDF_BASE_FOLDER = os.path.join(BASE_FOLDER, "Job_Creation")
+# CONFIG_PATH = os.path.join(BASE_FOLDER, "Config.ini")
+
+# #-------------------------------------------------------
+
+# MAX_RETRIES = 3
+# RETRY_DELAY = 5
+
+# # ================= LOAD LOB MAPPING =================
+
+
+# def load_lob_mapping():
+#     df_lob = pd.read_excel(LOB_MASTER_PATH)
+
+#     df_lob["LOB_CODE"] = df_lob["LOB_CODE"].astype(str).str.strip()
+#     df_lob["LOB_NAME"] = df_lob["LOB_NAME"].astype(str).str.strip()
+
+#     mapping = {}
+
+#     for _, row in df_lob.iterrows():
+#         code = row["LOB_CODE"]
+#         name = row["LOB_NAME"]
+
+#         if code not in mapping:
+#             mapping[code] = []
+
+#         mapping[code].append(name)
+
+#     return mapping
+
+# # ================= CRASH RECOVERY =================
+
+# def reset_in_progress():
+#     df = pd.read_excel(TRACKER_PATH)
+
+#     if "Status" in df.columns:
+#         df.loc[df["Status"] == "In Progress", "Status"] = "Pending"
+
+#     df.to_excel(TRACKER_PATH, index=False)
+#     print("Reset any In Progress jobs back to Pending")
+
+# # ================= READ PENDING JOBS =================
+
+# def get_pending_jobs():
+#     if not os.path.exists(TRACKER_PATH):
+#         print("Tracker file not found")
+#         return pd.DataFrame()
+
+#     df = pd.read_excel(TRACKER_PATH)
+
+#     if df.empty:
+#         return pd.DataFrame()
+
+#     pending = df[df["Status"] == "Pending"].copy()
+#     print(f"Total Pending Jobs: {len(pending)}")
+
+#     return pending
+
+# # ================= UPDATE TRACKER =================
+
+# def update_tracker(reference_id, job_id=None, status=None, error=None):
+
+#     df = pd.read_excel(TRACKER_PATH)
+
+#     for col in ["Job ID", "Status", "Error"]:
+#         if col in df.columns:
+#             df[col] = df[col].astype("string")
+
+#     idx = df.index[df["Reference ID"] == reference_id]
+
+#     if idx.empty:
+#         print(f"Reference ID not found -> {reference_id}")
+#         return
+
+#     row_index = idx[0]
+
+#     if job_id is not None:
+#         df.at[row_index, "Job ID"] = str(job_id)
+
+#     if status is not None:
+#         df.at[row_index, "Status"] = str(status)
+
+#     if error is not None:
+#         df.at[row_index, "Error"] = str(error)
+
+#     df.at[row_index, "Last Updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+#     df.to_excel(TRACKER_PATH, index=False)
+
+#     print(f"Tracker Updated -> {reference_id} | {status} | {error}")
+
+# # ================= LOGIN FUNCTION =================
+
+# async def login(page, url, username, password):
+
+#     await page.goto(url, timeout=60000)
+
+#     await page.locator("input[name='username']").fill(username)
+#     await page.locator("input[name='password']").fill(password)
+#     await page.locator("input[name='termsAccepted']").check()
+
+#     await page.get_by_role("button", name="Submit").click()
+
+#     print("Login Successful")
+
+#     await page.get_by_role("button", name="Take me there").first.click()
+#     await page.get_by_role("button", name="Jobs").click()
+#     await page.get_by_role("button", name="Upload Documents").click()
+
+#     print("Navigated to Upload Documents")
+
+
+# # ================= CREATE JOB FUNCTION =================
+
+# async def create_job(page, record, lob_mapping):
+
+#     ref_id = record["Reference ID"]
+#     print(f"Creating Job -> {ref_id}")
+
+#     folder_path = os.path.join(PDF_BASE_FOLDER, ref_id)
+
+#     current_term_files = []
+#     prior_term_files = []
+#     other_files = []
+
+#     # ================= DETECT FILE TYPES =================
+
+#     if os.path.exists(folder_path):
+
+#         files = [f for f in os.listdir(folder_path) if f.lower().endswith(".pdf")]
+
+#         NON_POLICY_KEYWORDS = [
+#             "binder",
+#             "quote",
+#             "proposal",
+#             "schedule",
+#             "endorsement",
+#             "accord",
+#             "application",
+#             "app",
+#             "endt",
+#             "accord"
+#         ]
+    
+#     # ================= CLASSIFY FILES =================
+
+#         # for file in files:
+#         #     file_lower = file.lower()
+
+#         #     is_current_term = False
+#         #     is_prior_term = False
+
+#         #     is_non_policy = any(word in file_lower for word in NON_POLICY_KEYWORDS)
+
+#         #     # ---- Detect CT ----
+#         #     if re.search(r"\b26[-_/]27\b", file_lower) and not is_non_policy:
+#         #         is_current_term = True
+
+#         #     # ---- Detect PT ----
+#         #     elif re.search(r"\b25[-_/]26\b", file_lower) and not is_non_policy:
+#         #         is_prior_term = True
+
+#         #     # ---- Date Range Format ----
+#         #     else:
+#         #         match = re.search(
+#         #             r"\d{1,2}-\d{1,2}-(\d{2})\s*to\s*\d{1,2}-\d{1,2}-(\d{2})",
+#         #             file_lower
+#         #         )
+
+#         #         if match and not is_non_policy:
+#         #             start_year = match.group(1)
+#         #             end_year = match.group(2)
+
+#         #             if start_year == "26" and end_year == "27":
+#         #                 is_current_term = True
+#         #             elif start_year == "25" and end_year == "26":
+#         #                 is_prior_term = True
+
+#         #     if is_current_term:
+#         #         current_term_files.append(file)
+#         #     elif is_prior_term:
+#         #         prior_term_files.append(file)
+#         #     else:
+#         #         other_files.append(file)
+
+
+#         for file in files:
+#             file_lower = file.lower()
+
+#             is_current_term = False
+#             is_prior_term = False
+
+#             # Check NON-POLICY keywords (these should block CT/PT)
+#             is_non_policy = any(word in file_lower for word in NON_POLICY_KEYWORDS)
+
+#             #  Step 1: If NON-POLICY → directly classify as OTHER
+#             if is_non_policy:
+#                 other_files.append(file)
+#                 continue
+
+#             # ---- Detect CT ----
+#             if re.search(r"\b26[-_/]27\b", file_lower):
+#                 is_current_term = True
+
+#             # ---- Detect PT ----
+#             elif re.search(r"\b25[-_/]26\b", file_lower):
+#                 is_prior_term = True
+
+#             # ---- Date Range Format ----
+#             else:
+#                 match = re.search(
+#                     r"\d{1,2}-\d{1,2}-(\d{2})\s*to\s*\d{1,2}-\d{1,2}-(\d{2})",
+#                     file_lower
+#                 )
+
+#                 if match:
+#                     start_year = match.group(1)
+#                     end_year = match.group(2)
+
+#                     if start_year == "26" and end_year == "27":
+#                         is_current_term = True
+#                     elif start_year == "25" and end_year == "26":
+#                         is_prior_term = True
+
+#             # ---- Classification ----
+#             if is_current_term:
+#                 current_term_files.append(file)
+
+#             elif is_prior_term:
+#                 prior_term_files.append(file)
+
+#             else:
+#                 other_files.append(file)
+
+
+
+    
+#     # ================= TAB SELECTION =================
+
+#     if len(other_files) == 0:
+
+#         print("Only CT & PT found -> Automatic Renewal")
+
+#         tab = page.get_by_role("tab", name="Automatic Renewal")
+#         await tab.wait_for(timeout=20000)
+#         await tab.click()
+
+#     else:
+
+#         print("Other documents found -> Marketed Renewal")
+
+#         tab = page.get_by_role("tab", name="Marketed Renewal")
+#         await tab.wait_for(timeout=20000)
+#         await tab.click()
+
+#     await page.wait_for_timeout(2000)
+
+#     # ================= SELECT LOB =================
+
+#     lob_code = str(record["LOB"]).strip()
+
+#     if lob_code not in lob_mapping:
+#         raise Exception(f"LOB Code not found in LOB Master: {lob_code}")
+
+#     possible_lob_names = lob_mapping[lob_code]
+
+#     print(f"Trying LOB names -> {possible_lob_names}")
+
+#     # Open dropdown
+#     await page.locator("#coverage").click()
+#     await page.get_by_role("listbox").wait_for()
+
+#     options = page.get_by_role("option")
+#     count = await options.count()
+
+#     selected = False
+
+#     for i in range(count):
+#         option_text = (await options.nth(i).inner_text()).strip()
+
+#         for lob_name in possible_lob_names:
+#             if option_text.lower() == lob_name.strip().lower():
+#                 await options.nth(i).click()
+#                 print(f"LOB Selected -> {option_text}")
+#                 selected = True
+#                 break
+
+#         if selected:
+#             break
+
+#     if not selected:
+#         raise Exception(f"No matching LOB found in dropdown for code: {lob_code}")
+    
+
+#     # ================= CHECKLIST =================
+
+#     await page.locator("#checklist").click()
+#     await page.get_by_role("listbox").wait_for()
+
+#     await page.locator("li[role='option']", has_text="Lite_ExdionPOD").click()
+
+#     print("Checklist Selected -> Lite_ExdionPOD")
+
+#     # ================= FILE UPLOAD =================
+
+#     ordered_files = current_term_files + prior_term_files + other_files
+
+#     for file in ordered_files:
+
+#         file_lower = file.lower()
+#         file_path = os.path.join(folder_path, file)
+
+#         # ===== CURRENT TERM =====
+#         if file in current_term_files:
+#             print(f"Uploading to Current Term -> {file}")
+#             label = page.locator("p:has-text('Current Term Policy')")
+#             section = label.locator("xpath=ancestor::div[.//input[@type='file']][1]")
+#             await section.locator("input[type='file']").set_input_files(file_path)
+
+#             await page.wait_for_load_state("networkidle")
+#             await page.wait_for_timeout(1500)
+
+#         # ===== PRIOR TERM =====
+#         elif file in prior_term_files:
+#             print(f"Uploading to Prior Term -> {file}")
+#             label = page.locator("p:has-text('Prior Term Policy')")
+#             section = label.locator("xpath=ancestor::div[.//input[@type='file']][1]")
+#             await section.locator("input[type='file']").set_input_files(file_path)
+
+#         # ===== OTHER DOCUMENTS =====
+#         else:
+
+#             if "endorsement" in file_lower or "endt" in file_lower:
+#                 label_text = "Endorsement"
+
+#             elif "quote" in file_lower or "qte" in file_lower or "quotation" in file_lower:
+#                 label_text = "Carrier Quote"
+
+#             elif "proposal" in file_lower:
+#                 label_text = "Proposal"
+
+#             elif "accord" in file_lower or "application" in file_lower or "app" in file_lower:
+#                 label_text = "Acord Application"
+
+#             elif "schedule" in file_lower:
+#                 label_text = "Schedule"
+
+#             elif "binder" in file_lower or "bind" in file_lower:
+#                 label_text = "Binder"
+
+#             else:
+#                 print(f"Not matched -> {file}")
+#                 continue
+
+#             print(f"Uploading to {label_text} -> {file}")
+
+#             label = page.locator(f"p:has-text('{label_text}')")
+#             await label.scroll_into_view_if_needed()
+
+#             section = label.locator("xpath=ancestor::div[.//input[@type='file']][1]")
+
+#             await section.locator("input[type='file']").set_input_files(file_path)
+
+
+#     # async with page.expect_event("dialog", timeout=40000) as dialog_info:
+#     #     await page.get_by_role("button", name="Generate Checklist").click()
+
+#     # dialog = await dialog_info.value
+
+#     # message = dialog.message
+#     # print("Popup message: %s", message)
+
+#     # # ===== HANDLE ERROR POPUP =====
+#     # if any(text in message.lower() for text in [
+#     #     "Please choose", "Proposal", "ACORD Application", "Carrier Quote", "Binder"
+#     # ]):
+
+#     #     error_msg = "Please choose Proposal or ACORD Application or Carrier Quote or Binder"
+
+#     #     await dialog.accept()
+
+#     #     update_tracker(
+#     #         reference_id=record["Reference ID"],
+#     #         status="Error",
+#     #         error=error_msg
+#     #     )
+
+#     #     return None
+
+
+#     # try:
+#     #     dialog = await dialog_info.value
+#     #     message = dialog.message.lower()
+
+#     #     print(f"Popup message -> {message}")
+
+#     #     if "please choose" in message:
+#     #         await dialog.accept()
+#     #         return None
+
+#     # except:
+#     #     # fallback if modal popup
+#     #     if await page.locator("text=Please choose").is_visible():
+#     #         print("Validation modal detected")
+
+#     #         await page.get_by_role("button", name="OK").click()
+
+#     #         return None
+
+#     # # Extract Job ID
+#     # match = re.search(r"Job ID:\s*(\S+)", message)
+#     # job_id = match.group(1) if match else None
+
+#     # print("Job ID: %s", job_id)
+
+#     # await page.wait_for_timeout(3000)
+
+#     # await dialog.accept()
+
+#     # print(f"Job Created Successfully -> {job_id}")
+
+
+#     await page.wait_for_timeout(10000)
+
+#     await page.get_by_role("button", name="Jobs").click()
+#     await page.get_by_role("button", name="Upload Documents").click()
+#     await page.wait_for_timeout(5000)
+
+#     await page.get_by_role("tab", name="Marketed Renewal").wait_for()
+
+#     # return job_id
+
+# # ================= MAIN FUNCTION =================
+
+# async def run_istudio():
+
+#     print("ISTUDIO started")
+
+#     config = ConfigParser()
+#     config.read(CONFIG_PATH)
+
+#     browser_name = config.get("CarrolliStudio", "browser")
+#     url = config.get("CarrolliStudio", "Link")
+#     username = config.get("CarrolliStudio", "User_ID")
+#     password = config.get("CarrolliStudio", "Password")
+
+#     # Crash recovery
+#     reset_in_progress()
+
+#     lob_mapping = load_lob_mapping()
+#     pending_df = get_pending_jobs()
+
+#     if pending_df.empty:
+#         print("No Pending Jobs Found")
+#         return
+
+#     async with async_playwright() as p:
+
+#         if browser_name.lower() == "chrome":
+#             browser = await p.chromium.launch(channel="chrome", headless=False)
+#         elif browser_name.lower() == "edge":
+#             browser = await p.chromium.launch(channel="msedge", headless=False)
+#         else:
+#             raise Exception("Unsupported browser")
+
+#         context = await browser.new_context()
+#         page = await context.new_page()
+
+#         await login(page, url, username, password)
+
+
+#         for _, row in pending_df.iterrows():
+
+#             ref_id = row["Reference ID"]
+#             attempt = 1
+
+#             while attempt <= MAX_RETRIES:
+
+#                 try:
+#                     if attempt == 1:
+#                         update_tracker(ref_id, status="In Progress")
+
+#                     print(f"\nProcessing {ref_id} | Attempt {attempt}")
+
+#                     job_id = await create_job(page, row, lob_mapping)
+
+#                     if job_id is None:
+#                         print(f"Skipping {ref_id} due to validation error")
+#                         break
+
+#                     update_tracker(ref_id, job_id=job_id, status="Completed")
+
+#                     break   # Success -> Exit retry loop
+
+#                 except Exception as e:
+
+#                     print(f"Attempt {attempt} Failed -> {ref_id}")
+#                     print(str(e))
+
+#                     if attempt == MAX_RETRIES:
+#                         print(f"Max retries reached -> {ref_id}")
+#                         update_tracker(ref_id, status="Error")
+#                         break
+
+#                     attempt += 1
+
+#                     await page.wait_for_timeout(20000)
+#                     await page.get_by_role("button", name="Jobs").click()
+#                     await page.get_by_role("button", name="Upload Documents").click()
+#                     await page.wait_for_timeout(5000)
+
+#                     print(f"Retrying in {RETRY_DELAY} seconds...")
+#                     await asyncio.sleep(RETRY_DELAY)
+
+#                     # Optional: reload page before retry
+#                     if not page.is_closed():
+#                         await page.reload()
+
+#         print("\nAll Jobs Processed")
+
+#         try:
+#             print("Logging out...")
+
+#             profile_btn = page.locator("svg[data-testid='KeyboardArrowDownIcon']").first
+#             await profile_btn.click()
+
+#             logout_btn = page.get_by_role("menuitem", name="Sign Out")
+#             await logout_btn.click()
+
+#             print("Logout Successful")
+
+#         except Exception as e:
+#             print("Logout failed:", str(e))
+
+#         await browser.close()
+
+
+# if __name__ == "__main__":
+#     asyncio.run(run_istudio())
+
+
+
+import asyncio
+import re
+from playwright.async_api import async_playwright
+from configparser import ConfigParser
+import pandas as pd
+import os
+from datetime import datetime
+
+# ================= PATH CONFIG =================
+
+BASE_FOLDER = r"C:\Users\vijay_m\OneDrive - Exdion Solutions Pvt. Ltd.-70692290\Documents\Project_Job_Creation\carroll"
+
+TRACKER_PATH = os.path.join(BASE_FOLDER, "Carroll_Tracker.xlsx")
+LOB_MASTER_PATH = os.path.join(BASE_FOLDER, "Lob_Mapping.xlsx")
+PDF_BASE_FOLDER = os.path.join(BASE_FOLDER, "Job_Creation")
+CONFIG_PATH = os.path.join(BASE_FOLDER, "Config.ini")
+
+
+MAX_RETRIES = 3
+RETRY_DELAY = 5
+
+# ================= LOAD LOB MAPPING =================
+
+
+def load_lob_mapping():
+    df_lob = pd.read_excel(LOB_MASTER_PATH)
+
+    df_lob["LOB_CODE"] = df_lob["LOB_CODE"].astype(str).str.strip()
+    df_lob["LOB_NAME"] = df_lob["LOB_NAME"].astype(str).str.strip()
+
+    mapping = {}
+
+    for _, row in df_lob.iterrows():
+        code = row["LOB_CODE"]
+        name = row["LOB_NAME"]
+
+        if code not in mapping:
+            mapping[code] = []
+
+        mapping[code].append(name)
+
+    return mapping
+
+# ================= CRASH RECOVERY =================
+
+def reset_in_progress():
+    df = pd.read_excel(TRACKER_PATH)
+
+    if "Status" in df.columns:
+        df.loc[df["Status"] == "In Progress", "Status"] = "Pending"
+
+    df.to_excel(TRACKER_PATH, index=False)
+    print("Reset any In Progress jobs back to Pending")
+
+# ================= READ PENDING JOBS =================
+
+def get_pending_jobs():
+    if not os.path.exists(TRACKER_PATH):
+        print("Tracker file not found")
+        return pd.DataFrame()
+
+    df = pd.read_excel(TRACKER_PATH)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    pending = df[df["Status"] == "Pending"].copy()
+    print(f"Total Pending Jobs: {len(pending)}")
+
+    return pending
+
+# ================= UPDATE TRACKER =================
+
+def update_tracker(reference_id, job_id=None, status=None, error=None):
+
+    df = pd.read_excel(TRACKER_PATH)
+
+    for col in ["Job ID", "Status", "Error"]:
+        if col in df.columns:
+            df[col] = df[col].astype("string")
+
+    idx = df.index[df["Reference ID"] == reference_id]
+
+    if idx.empty:
+        print(f"Reference ID not found -> {reference_id}")
+        return
+
+    row_index = idx[0]
+
+    if job_id is not None:
+        df.at[row_index, "Job ID"] = str(job_id)
+
+    if status is not None:
+        df.at[row_index, "Status"] = str(status)
+
+    if error is not None:
+        df.at[row_index, "Error"] = str(error)
+
+    df.at[row_index, "Last Updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    df.to_excel(TRACKER_PATH, index=False)
+
+    print(f"Tracker Updated -> {reference_id} | {status} | {error}")
+
+# ================= LOGIN FUNCTION =================
+
+async def login(page, url, username, password):
+
+    await page.goto(url, timeout=60000)
+
+    await page.locator("input[name='username']").fill(username)
+    await page.locator("input[name='password']").fill(password)
+    await page.locator("input[name='termsAccepted']").check()
+
+    await page.get_by_role("button", name="Submit").click()
+
+    print("Login Successful")
+
+    await page.get_by_role("button", name="Take me there").first.click()
+    await page.get_by_text("Jobs", exact=True).click()
+
+    upload_docs = page.get_by_text("Upload Documents", exact=True)
+    await upload_docs.wait_for(state="visible")
+    await upload_docs.click()
+    
+# ================= CREATE JOB FUNCTION =================
+
+async def create_job(page, record, lob_mapping):
+
+    ref_id = record["Reference ID"]
+    print(f"Creating Job -> {ref_id}")
+
+    folder_path = os.path.join(PDF_BASE_FOLDER, ref_id)
+
+    current_term_files = []
+    prior_term_files = []
+    other_files = []
+
+    valid_doc_uploaded = False
+
+    # ================= DETECT FILE TYPES =================
+
+    if os.path.exists(folder_path):
+
+        files = [f for f in os.listdir(folder_path) if f.lower().endswith(".pdf")]
+
+        NON_POLICY_KEYWORDS = [
+            "binder",
+            "quote",
+            "proposal",
+            "schedule",
+            "endorsement",
+            "accord",
+            "application",
+            "app",
+            "endt",
+            "accord"
+        ]
+    
+    # ================= CLASSIFY FILES =================
+
+        for file in files:
+            file_lower = file.lower()
+
+            is_current_term = False
+            is_prior_term = False
+
+            # Check NON-POLICY keywords (these should block CT/PT)
+            is_non_policy = any(word in file_lower for word in NON_POLICY_KEYWORDS)
+
+            #  Step 1: If NON-POLICY → directly classify as OTHER
+            if is_non_policy:
+                other_files.append(file)
+                continue
+
+            # ---- Detect CT ----
+            if re.search(r"\b26[-_/]27\b", file_lower):
+                is_current_term = True
+
+            # ---- Detect PT ----
+            elif re.search(r"\b25[-_/]26\b", file_lower):
+                is_prior_term = True
+
+            # ---- Date Range Format ----
+            else:
+                match = re.search(
+                    r"\d{1,2}-\d{1,2}-(\d{2})\s*to\s*\d{1,2}-\d{1,2}-(\d{2})",
+                    file_lower
+                )
+
+                if match:
+                    start_year = match.group(1)
+                    end_year = match.group(2)
+
+                    if start_year == "26" and end_year == "27":
+                        is_current_term = True
+                    elif start_year == "25" and end_year == "26":
+                        is_prior_term = True
+
+            # ---- Classification ----
+            if is_current_term:
+                current_term_files.append(file)
+
+            elif is_prior_term:
+                prior_term_files.append(file)
+
+            else:
+                other_files.append(file)
+    
+    # ================= VALIDATION =================
+
+    has_ct = len(current_term_files) > 0
+    has_pt = len(prior_term_files) > 0
+
+    if len(other_files) == 0:
+        renewal_type = "Automatic"
+    else:
+        renewal_type = "Marketed"
+
+    print(f"Renewal Type: {renewal_type}")
+    print(f"CT: {has_ct}, PT: {has_pt}, Other: {len(other_files)}")
+
+    if renewal_type == "Automatic":
+        if not (has_ct and has_pt):
+            raise Exception("Automatic Renewal requires BOTH CT and PT")
+
+    # ================= TAB =================
+
+    tab = page.get_by_role("tab", name=f"{renewal_type} Renewal")
+    await tab.wait_for()
+    await tab.click()
+
+    await page.wait_for_load_state("networkidle")
+
+    # ================= SELECT LOB =================
+
+    lob_code = str(record["LOB"]).strip()
+
+    if lob_code not in lob_mapping:
+        raise Exception(f"LOB Code not found in LOB Master: {lob_code}")
+
+    possible_lob_names = lob_mapping[lob_code]
+
+    print(f"Trying LOB names -> {possible_lob_names}")
+
+    # Open dropdown
+    await page.locator("#coverage").click()
+    await page.get_by_role("listbox").wait_for()
+
+    options = page.get_by_role("option")
+    count = await options.count()
+
+    selected = False
+
+    for i in range(count):
+        option_text = (await options.nth(i).inner_text()).strip()
+
+        for lob_name in possible_lob_names:
+            if option_text.lower() == lob_name.strip().lower():
+                await options.nth(i).click()
+                print(f"LOB Selected -> {option_text}")
+                selected = True
+                break
+
+        if selected:
+            break
+
+    if not selected:
+        raise Exception(f"No matching LOB found in dropdown for code: {lob_code}")
+    
+
+    # ================= CHECKLIST =================
+
+    await page.locator("#checklist").click()
+    await page.get_by_role("listbox").wait_for()
+
+    await page.locator("li[role='option']", has_text="Lite_ExdionPOD").click()
+
+    print("Checklist Selected -> Lite_ExdionPOD")
+
+    # ================= FILE UPLOAD =================
+
+    ordered_files = current_term_files + prior_term_files + other_files
+
+    for file in ordered_files:
+
+        file_lower = file.lower()
+        file_path = os.path.join(folder_path, file)
+
+        # ===== CURRENT TERM =====
+        if file in current_term_files:
+            print(f"Uploading to Current Term -> {file}")
+            label = page.locator("p:has-text('Current Term Policy')")
+            section = label.locator("xpath=ancestor::div[.//input[@type='file']][1]")
+            await section.locator("input[type='file']").set_input_files(file_path)
+
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(1500)
+
+        # ===== PRIOR TERM =====
+        elif file in prior_term_files:
+            print(f"Uploading to Prior Term -> {file}")
+            label = page.locator("p:has-text('Prior Term Policy')")
+            section = label.locator("xpath=ancestor::div[.//input[@type='file']][1]")
+            await section.locator("input[type='file']").set_input_files(file_path)
+
+        # ===== OTHER DOCUMENTS =====
+        else:
+
+            if "endorsement" in file_lower or "endt" in file_lower:
+                label_text = "Endorsement"
+
+            elif "quote" in file_lower or "qte" in file_lower or "quotation" in file_lower:
+                label_text = "Carrier Quote"
+                valid_doc_uploaded = True
+
+            elif "proposal" in file_lower:
+                label_text = "Proposal"
+                valid_doc_uploaded = True
+
+            elif "accord" in file_lower or "application" in file_lower or "app" in file_lower:
+                label_text = "Acord Application"
+                valid_doc_uploaded = True
+
+            elif "schedule" in file_lower:
+                label_text = "Schedule"
+                valid_doc_uploaded = True
+
+            elif "binder" in file_lower or "bind" in file_lower:
+                label_text = "Binder"
+                valid_doc_uploaded = True
+
+            else:
+                print(f"Not matched -> {file}")
+                continue
+
+            print(f"Uploading to {label_text} -> {file}")
+
+            label = page.locator(f"p:has-text('{label_text}')")
+            await label.scroll_into_view_if_needed()
+
+            section = label.locator("xpath=ancestor::div[.//input[@type='file']][1]")
+
+            await section.locator("input[type='file']").set_input_files(file_path)
+            
+    if renewal_type == "Marketed":
+        if not has_ct:
+            raise Exception("Marketed requires Current Term document")
+
+        if not valid_doc_uploaded:
+            raise Exception("Marketed requires at least one valid doc (Proposal/Quote/Application/Binder)")
+
+
+
+    # try:
+
+    #     async with page.expect_event("dialog", timeout=40000) as dialog_info:
+    #         await page.get_by_role("button", name="Generate Checklist").click()
+
+    #     dialog = await dialog_info.value
+
+    #     message = dialog.message
+    #     print("Popup message: ", message)
+
+    # except Exception as e:
+    #     raise Exception(f"No popup received after Generate Checklist: {str(e)}")
+
+    #error_msg = "Please choose Proposal or ACORD Application or Carrier Quote or Binder"
+    msg_lower = message.lower()
+    if "please choose" in msg_lower:
+        await dialog.accept()
+        raise Exception("Validation Error: Required documents missing")
+
+    # Extract Job ID
+    match = re.search(r"Job ID:\s*(\S+)", message)
+    #match = re.search(r"Job ID:\s*([a-zA-Z0-9]+)", message)
+
+    job_id = match.group(1) if match else None
+
+    print("Job ID: ", job_id)
+
+    if not job_id:
+        await dialog.accept()
+        raise Exception("Job ID not found in popup")
+
+    update_tracker(ref_id, job_id=job_id, status="Completed")
+
+    await page.wait_for_timeout(3000)
+
+    await dialog.accept()
+
+    print(f"Job Created Successfully -> {job_id}")
+
+    await page.wait_for_url("**jobcsrlisting**", timeout=30000)
+    await page.get_by_placeholder("Search by Job ID").wait_for(timeout=20000)
+
+    try:
+        jobs = page.get_by_text("Jobs", exact=True)
+        await jobs.wait_for(state="visible", timeout=5000)
+        await jobs.click()
+
+        upload_docs = page.get_by_text("Upload Documents", exact=True)
+        await upload_docs.wait_for(state="visible", timeout=5000)
+        await upload_docs.click()
+
+    except Exception as nav_err:
+        print("Navigation warning:", str(nav_err))
+
+    return job_id
+
+# ================= MAIN FUNCTION =================
+
+async def run_istudio():
+
+    print("ISTUDIO started")
+
+    config = ConfigParser()
+    config.read(CONFIG_PATH)
+
+    browser_name = config.get("CarrolliStudio", "browser")
+    url = config.get("CarrolliStudio", "Link")
+    username = config.get("CarrolliStudio", "User_ID")
+    password = config.get("CarrolliStudio", "Password")
+
+    # Crash recovery
+    reset_in_progress()
+
+    lob_mapping = load_lob_mapping()
+    pending_df = get_pending_jobs()
+
+    if pending_df.empty:
+        print("No Pending Jobs Found")
+        return
+
+    async with async_playwright() as p:
+
+        if browser_name.lower() == "chrome":
+            browser = await p.chromium.launch(channel="chrome", headless=False)
+        elif browser_name.lower() == "edge":
+            browser = await p.chromium.launch(channel="msedge", headless=False)
+        else:
+            raise Exception("Unsupported browser")
+
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        await login(page, url, username, password)
+
+
+        for _, row in pending_df.iterrows():
+
+            ref_id = row["Reference ID"]
+            attempt = 1
+
+            while attempt <= MAX_RETRIES:
+
+                try:
+                    if attempt == 1:
+                        update_tracker(ref_id, status="In Progress")
+
+                    print(f"\nProcessing {ref_id} | Attempt {attempt}")
+
+                    job_id = await create_job(page, row, lob_mapping)
+
+                    if job_id:
+                        print(f"Completed -> {ref_id}")
+                        break
+                    else:
+                        raise Exception("Job ID not Generated")
+
+                except Exception as e:
+
+                    print(f"Attempt {attempt} Failed -> {ref_id}")
+                    print(str(e))
+
+                    df = pd.read_excel(TRACKER_PATH)
+                    existing_job = df.loc[df["Reference ID"] == ref_id, "Job ID"].values
+
+                    if len(existing_job) > 0 and pd.notna(existing_job[0]):
+                        print("Job ID already exists → marking Completed")
+                        update_tracker(ref_id, status="Completed")
+                        break
+
+                    if attempt == MAX_RETRIES:
+                        print(f"Max retries reached -> {ref_id}")
+                        update_tracker(ref_id, status="Error", error=str(e))
+                        break
+
+                    attempt += 1
+
+                    print(f"Retrying in {RETRY_DELAY} seconds...")
+                    await asyncio.sleep(RETRY_DELAY)
+
+                    if page.is_closed():
+                        print("Page closed → reopening browser page")
+                        page = await context.new_page()
+                        await login(page, url, username, password)
+                    else:
+                        print("Reloading page")
+                        await page.reload()
+                        await page.wait_for_load_state("networkidle")
+
+                    print("Navigating to Jobs → Upload Documents")
+
+                    jobs = page.get_by_text("Jobs", exact=True)
+                    await jobs.wait_for(state="visible", timeout=15000)
+                    await jobs.click()
+
+                    upload_docs = page.get_by_text("Upload Documents", exact=True)
+                    await upload_docs.wait_for(state="visible")
+                    await upload_docs.click()
+
+        print("\nAll Jobs Processed")
+
+        try:
+            print("Logging out...")
+
+            profile_btn = page.get_by_text("Carroll", exact=True)
+            await profile_btn.click()
+
+            logout_btn = page.get_by_role("menuitem", name="Sign Out")
+            await logout_btn.click()
+
+            print("Logout Successful")
+
+        except Exception as e:
+            print("Logout failed:", str(e))
+
+        await browser.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(run_istudio()) 
+
+
+
+
+
+
+
+
+# import asyncio
+# from Carroll_Epic import run_epic
+# from Carroll_iStudio import run_istudio
+
+
+# async def Job_Creation():
+
+#     print("========== PHASE 1 : EPIC ==========")
+#     await run_epic()
+
+#     print("========== PHASE 2 : ISTUDIO ==========")
+#     await run_istudio()
+
+#     print("========== JOB CREATION COMPLETED ==========")
+
+
+# if __name__ == "__main__":
+#     asyncio.run(Job_Creation())
+
+################################################################################################################
+
+import asyncio
+from Carroll_Epic import run_epic
+from Carroll_iStudio import run_istudio
+from Email_Alert import send_email
+import traceback
+import time
+
+async def Job_Creation():
+
+    start = time.time()
+
+    try:
+        print("========== PHASE 1 : EPIC ==========")
+        await run_epic()
+
+    except Exception as e:
+        error = traceback.format_exc()
+        send_email("EPIC FAILED", error)
+        return
+
+    try:
+        print("========== PHASE 2 : ISTUDIO ==========")
+        await run_istudio()
+
+    except Exception as e:
+        error = traceback.format_exc()
+        send_email("ISTUDIO FAILED", error)
+        return
+
+    #send_email("JOB SUCCESS", "Epic + iStudio completed successfully")
+    end = time.time()
+    duration = round(end - start, 2)
+
+    send_email("JOB SUCCESS", f"Epic + iStudio completed successfully\nTime Taken: {duration} seconds")
+
+###########################3#-------------------------------------- PRODUCTION LEVEL ----------------------------------------###########################################
+
+# import asyncio
+# from Carroll_Epic import run_epic
+# from Carroll_iStudio import run_istudio
+# from Email_Alert import send_email
+# import traceback
+# import time
+
+# PHASES = [
+#     ("EPIC", run_epic),
+#     ("ISTUDIO", run_istudio)
+# ]
+
+
+# async def Job_Creation():
+
+#     for name, func in PHASES:
+
+#         start = time.time()
+
+#         try:
+#             print(f"========== RUNNING {name} ==========")
+
+#             await func()
+
+#             print(f" {name} COMPLETED")
+
+#         except Exception as e:
+
+#             error = traceback.format_exc()
+
+#             print(f" {name} FAILED")
+
+#             send_email(f"{name} FAILED", error)
+
+#             return   # stop pipeline
+
+#     send_email("JOB SUCCESS", "Epic + iStudio completed successfully")
+#     end = time.time()
+#     duration = round(end - start, 2)
+
+#     send_email("JOB SUCCESS", f"Epic + iStudio completed successfully\nTime Taken: {duration} seconds") 
+
+# if __name__ == "__main__":
+#     asyncio.run(Job_Creation())
+
+
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+
+
+
+
+
+from configparser import ConfigParser
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import os
+
+BASE_FOLDER = r"C:\Users\vijay_m\OneDrive - Exdion Solutions Pvt. Ltd.-70692290\Documents\Project_Job_Creation\carroll"
+
+def send_email(subject, body):
+
+    config = ConfigParser()
+    config.read(os.path.join(BASE_FOLDER, "Config.ini"))
+
+    sender = config.get("Email", "SENDER")
+    password = config.get("Email", "PASSWORD")
+    receiver = config.get("Email", "RECEIVER")
+
+    msg = MIMEMultipart()
+    msg["From"] = sender
+    msg["To"] = receiver
+    msg["Subject"] = subject
+
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(sender, password)
+        server.send_message(msg)
+        server.quit()
+
+        print("Email sent")
+
+    except Exception as e:
+        print("Email failed:", e)
+
+
+
+
+
+
+
+
+
